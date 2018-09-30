@@ -4,369 +4,297 @@
 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from keras.models import Input
-from keras.models import Model
-from keras.models import Sequential
-from keras.layers import Dense
-from keras.layers import Dropout
-from keras.layers import LSTM
-from keras.layers import Merge
-from keras.layers import Masking
-from keras.layers.normalization import BatchNormalization
-from keras.models import model_from_json
-from keras.callbacks import ModelCheckpoint
+from MyModule import lstm
 from MyModule import data
-from MyModule import evaluate
-import os
-
-import tensorflow as tf
-from keras import backend as K
-import gc
 
 
-def check_param(origin_params, need_params):
-    for np in need_params:
-        if not origin_params:
-            exit('缺少参数' + np)
-
-
-def build_lstm_models(lstm_config):
-    model = Sequential()
-    model.add(Masking(mask_value=-1, input_shape=(1, lstm_config['max_features'])))
-    model.add(LSTM(input_shape=(lstm_config['input_shape'][0], lstm_config['input_shape'][1]),
-                   output_dim=lstm_config['layers'][0],
-                   activation=lstm_config['activation'], recurrent_activation=lstm_config['recurrent_activation'],
-                   return_sequences=True))
-    model.add(Dropout(lstm_config['dropout']))
-    for i in range(1, len(lstm_config['layers'])):
-        model.add(LSTM(output_dim=lstm_config['layers'][i],
-                       activation=lstm_config['activation'], recurrent_activation=lstm_config['recurrent_activation'],
-                       return_sequences=True))
-        model.add(Dropout(lstm_config['dropout']))
-    return model
-
-
-def add_multi_dense(model, dense_config):
-    for i in range(len(dense_config['layers'])):
-        model.add(Dense(dense_config['layers'][i]))
-        model.add(Dropout(dense_config['dropout']))
-    model.add(Dense(1))
-    return model
-
-
-def load_model_and_weights(model_path, weight_path):
+def find_best_lstm_layers_nodes(is_train=True):
     """
-    加载已有模型，有参数则加载相应参数
-    :param model_path: 模型路径
-    :param weight_path: 参数路径
+    寻找lstm块的最优层数和每层节点数
+    :param is_train:
     :return:
     """
-    if os.path.exists(model_path):
-        print('load model...')
-        json_string = open(model_path).read()
-        model = model_from_json(json_string)
-        # 有参数则加载
-        if os.path.exists(weight_path):
-            print('load weights...')
-            model.load_weights(weight_path)
-        return model
-    else:
-        exit('找不到模型' + model_path)
+    # layers = [2, 3, 4]
+    # nodes = [50, 100, 200, 300, 500]
+    layers = [5, 6, 7]
+    nodes = [50]
+    conf = lstm.get_init_config()
+    for l in layers:
+        for n in nodes:
+            conf['model_conf']['lstm_conf']['layers'] = [n] * l
+            conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/FindBestLSTMBlock/model_lstm_block_layers' + str(l) + '_nodes' + str(n) + '.json'
+            conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/FindBestLSTMBlock/weights_lstm_block_layers' + str(l) + '_nodes' + str(n) + '.best.hdf5'
+            if is_train:
+                lstm.train(conf)
+            else:
+                # conf['model_conf']['test_split'] = 1
+                lstm.predict(conf, save_result=True, show_fitting_curve=True)
 
 
-def build_model(model_path, weight_path, lstm_config, dense_config):
-    # 存在模型则直接加载
-    if os.path.exists(model_path):
-        print('load model...')
-        model = load_model_and_weights(model_path, weight_path)
-    else:
-        print('build new model...')
-        # 创建一个多层的lstm单元, PM2.5、Press、RH等六个时间序列特征作为输入
-        lstm_model = build_lstm_models(lstm_config)
-        # 为时间特征单独创建一个全连接层
-        date_model = Sequential()
-        date_model.add(
-            Dense(input_shape=(dense_config['date_features_shape'][0], dense_config['date_features_shape'][1]),
-                  units=dense_config['date_features_shape'][1], activation='sigmoid'))
-        # 合并一个LSTM和一个时间特征的全链接层
-        model = Sequential()
-        model.add(Merge([lstm_model, date_model], mode='concat'))
-        model = add_multi_dense(model, dense_config)
-        # save model structure
-        open(model_path, 'w').write(model.to_json())
-
-    model.summary()
-    model.compile(loss='mse', optimizer='RMSprop')
-    return model
-
-
-def process_data(df_raw, time_steps, train_num):
-    max_time_step = max(time_steps.values())
-    # pop the date features
-    df_date = df_raw.pop('Month')
-    df_date = pd.concat([df_date, df_raw.pop('Day')], axis=1)
-    df_date = pd.concat([df_date, df_raw.pop('Hour')], axis=1)
-    df_date = df_date.loc[max_time_step:]
-
-    # processing the sequence features
-    df_raw = data.process_sequence_features(df_raw, time_steps=time_steps)
-    df_raw = df_raw.loc[max_time_step:]
-    # encoding the date features
-    df_date_encode = data.encoding_features(df_date, ['Month', 'Hour', 'Day'])
-
-    # normalization
-    y_scaled, y_scaler = data.min_max_scale(np.array(df_raw.pop('PM25')).reshape(-1, 1))
-    X_scaled, X_scaler = data.min_max_scale(df_raw)
-    date_encode = np.array(df_date_encode)
-
-    # reshape y
-    train_y = y_scaled[:train_num]
-    test_y = y_scaled[train_num:]
-    train_y = train_y.reshape((train_y.shape[0], 1, train_y.shape[1]))
-    test_y = test_y.reshape((test_y.shape[0], 1, test_y.shape[1]))
-    # reshape X
-    X_scaled = X_scaled.reshape((X_scaled.shape[0], 1, X_scaled.shape[1]))
-    date_encode = date_encode.reshape((date_encode.shape[0], 1, date_encode.shape[1]))
-    train_X = []
-    test_X = []
-    # 分割，将PM2.5,Press等时间序列特征作为一个lstm模型的输入
-    train_X.append(X_scaled[:train_num, :, :])
-    test_X.append(X_scaled[train_num:, :, :])
-    # 日期时间特征
-    train_X.append(date_encode[:train_num, :, :])
-    test_X.append(date_encode[train_num:, :, :])
-
-    return train_X, test_X, train_y, test_y, y_scaler
-
-
-def train(df_raw, model_path, weight_path, lstm_config, dense_config, time_steps, epochs=100, batch_size=100,
-          test_split=0.3):
-    train_num = int(len(df_raw) * (1 - test_split))
-    train_X, test_X, train_y, test_y, y_scaler = process_data(df_raw, time_steps, train_num)
-
-    # build model
-    model = build_model(model_path, weight_path, lstm_config, dense_config, time_steps)
-
-    # checkpoint
-    checkpoint = ModelCheckpoint(weight_path, monitor='val_loss', verbose=1, save_best_only=True, mode='min')
-    callbacks_list = [checkpoint]
-    history = model.fit(train_X, train_y, epochs=epochs, batch_size=batch_size, validation_data=(test_X, test_y),
-                        verbose=1, callbacks=callbacks_list, shuffle=False)
-
-    # draw the loss curve
-    # evaluate.draw_loss_curve(figure_num=0, train_loss=history.history['loss'], val_loss=history.history['val_loss'])
-
-    # draw to compare the original data and the predicted data, and print the evaluation metrics
-    pred_y = model.predict(test_X)
-    test_y = data.inverse_to_original_data(train_y.reshape(1, -1), test_y.reshape(1, -1), scaler=y_scaler,
-                                           train_num=train_num)
-    pred_y = data.inverse_to_original_data(train_y.reshape(1, -1), pred_y.reshape(1, -1), scaler=y_scaler,
-                                           train_num=train_num)
-    del model
-    gc.collect()
-    K.clear_session()
-    tf.reset_default_graph()
-    return test_y, pred_y
-
-
-def predict(df_raw, param_conf, save_result=False, show_fitting_curve=False):
+def find_best_dense_layers_nodes(is_train=True):
     """
-    用某个模型进行预测
-    :param df_raw: 数据
-    :param param_conf: 配置参数
-    :param save_result: 是否保存预测结果
-    :param show_fitting_curve: 是否显示拟合曲线
+    寻找全链接层的最优层数和每层节点数
+    :param is_train:
     :return:
     """
-    # process data and split data
-    train_num = int(len(df_raw) * (1 - param_conf['test_split']))
-    X_train, X_test, y_train, y_test, y_scaler = process_data(df_raw, param_conf['time_steps'], train_num)
-
-    # load model and weights
-    model = load_model_and_weights(param_conf['model_path'], param_conf['weight_path'])
-
-    # predict
-    y_pred = model.predict(X_test)
-    y_true = y_scaler.inverse_transform(y_test.reshape(-1, 1))
-    y_pred = y_scaler.inverse_transform(y_pred.reshape(-1, 1))
-
-    # 保存评估结果
-    if save_result:
-        df_all_metrics = evaluate.all_metrics(y_true, y_pred)
-        df_all_metrics.to_csv(param_conf['model_path'] + '.csv', index=False)
-
-    # 显示拟合曲线
-    if show_fitting_curve:
-        evaluate.draw_fitting_curve(y_true, y_pred)
-
-    del model
-    gc.collect()
-    K.clear_session()
-    tf.reset_default_graph()
-    return y_true, y_pred
+    layers = [1, 2]
+    nodes = [128, 256, 512]
+    conf = lstm.get_init_config()
+    conf['model_conf']['lstm_conf']['layers'] = [] * 3
+    for l in layers:
+        for n in nodes:
+            conf['model_conf']['dense_conf']['layers'] = [n] * l
+            conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/FindBestDense/model_dense_layers' + str(l) + '_nodes' + str(n) + '.json'
+            conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/FindBestDense/weights_dense_layers' + str(l) + '_nodes' + str(n) + '.best.hdf5'
+            if is_train:
+                lstm.train(conf)
+            else:
+                conf['model_conf']['test_split'] = 1.0
+                lstm.predict(conf, save_result=True)
 
 
-def main(data_path, cols, time_steps, test_split, model_root_path, lstm_layers, lstm_layer_nodes, is_train=True):
-    # 参数设置
-    epoch = 1000
-    # batch = 1024
-    batch = 512
-    test_split = 0.4
-    # lstm_layers = [2, 3, 4, 5]
-    # lstm_layers = [3]
-    # lstm_layer_nodes = [300, 600, 900, 1200]
-    lstm_activation = 'softsign'
-    lstm_recurrent_activation = 'hard_sigmoid'
-    lstm_input_shape = (1, 24 * 6)
-    lstm_dropout = 0.3
-    dense_layers = [1024, 1024]
-    dense_activation = 'relu'
-    date_features_shape = (1, 12 + 31 + 24)
-    dense_dropout = 0.5
+def find_best_epoch_and_batch_size(is_train=True):
+    """
+    寻找最优的epoch和batch_size
+    :param is_train:
+    :return:
+    """
+    epochs = [500, 1000, 1500]
+    batch_sizes = [24, 48, 72, 96]
+    conf = lstm.get_init_config()
+    conf['model_conf']['lstm_conf']['layers'] = [] * 3
+    conf['model_conf']['dense_conf']['layers'] = []
+    for e in epochs:
+        for bs in batch_sizes:
+            conf['model_conf']['epochs'] = e
+            conf['model_conf']['batch_size'] = bs
+            conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/FindBestDense/model_epochs' + str(e) + '_batch' + str(bs) + '.json'
+            conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/FindBestDense/weights_epochs' + str(e) + '_batch' + str(bs) + '.best.hdf5'
+            if is_train:
+                lstm.train(conf)
+            else:
+                conf['model_conf']['test_split'] = 1.0
+                lstm.predict(conf, save_result=True)
 
+
+def effect_of_other_series_feature(is_train=True):
+    """
+    其他时序特征对预测结果的影响
+    :param is_train:
+    :return:
+    """
+    features = {
+        'pm25': {
+            'cols': ['PM25', 'Month', 'Day', 'Hour'],
+            'time_steps': {'PM25': 5}
+        },
+        'pm25_meteorology': {
+            'cols': ['PM25', 'Press', 'RH', 'Temp', 'Wind Speed', 'Wind Direction', 'Month', 'Day', 'Hour'],
+            'time_steps': {
+                'PM25': 5,
+                'Press': 24,
+                'RH': 8,
+                'Temp': 24,
+                'Wind Speed': 11,
+                'Wind Direction': 11
+            }
+        },
+        'pm25_other_pollutant': {
+            'cols': ['PM25', 'CO', 'NO2', 'O3', 'SO2', 'PM10', 'Month', 'Day', 'Hour'],
+            'time_steps': {
+                'PM25': 5,
+                'CO': 10,
+                'NO2': 8,
+                'O3': 7,
+                'SO2': 4,
+                'PM10': 4
+            }
+        }
+    }
+    conf = lstm.get_init_config()
+    conf['model_conf']['lstm_conf']['layers'] = [300] * 3
+    conf['model_conf']['dense_conf']['layers'] = [1024]
+    for f in features:
+        conf['data_conf']['use_cols'] = features[f]['cols']
+        conf['model_conf']['time_steps'] = features[f]['time_steps']
+        conf['model_conf']['lstm_conf']['max_feature_length'] = 24 * len(conf['model_conf']['time_steps'])
+        conf['model_conf']['lstm_conf']['input_shape'] = (1, 24 * len(conf['model_conf']['time_steps']))
+        conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/EffectOfOtherSeriesFeature/model_' + f + '_.best.json'
+        conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/EffectOfOtherSeriesFeature/weights_' + f + '_.best.hdf5'
+        if is_train:
+            lstm.train(conf)
+        else:
+            conf['model_conf']['test_split'] = 1.0
+            lstm.predict(conf, save_result=True)
+
+
+def fixed_time_lags(is_train=True):
+    """
+    对比固定时滞（窗口）大小提取特征
+    :param is_train:
+    :return:
+    """
+    fixed_size = 5
+    fixed_time_steps = {
+        'PM25': fixed_size,
+        'Press': fixed_size,
+        'RH': fixed_size,
+        'Temp': fixed_size,
+        'Wind Speed': fixed_size,
+        'Wind Direction': fixed_size,
+        'CO': fixed_size,
+        'NO2': fixed_size,
+        'O3': fixed_size,
+        'SO2': fixed_size,
+        'PM10': fixed_size
+    }
+    conf = lstm.get_init_config()
+    conf['model_conf']['lstm_conf']['layers'] = [300] * 3
+    conf['model_conf']['dense_conf']['layers'] = [1024]
+    conf['model_conf']['time_steps'] = fixed_time_steps
+    conf['model_conf']['lstm_conf']['max_feature_length'] = fixed_size * len(conf['model_conf']['time_steps'])
+    conf['model_conf']['lstm_conf']['input_shape'] = (1, fixed_size * len(conf['model_conf']['time_steps']))
+    conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/FixedTimeLags/model_fixed_time_lags_.best.json'
+    conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/FixedTimeLags/weights_fixed_time_lags_.best.hdf5'
     if is_train:
-        # 训练
-        print('训练模型...')
-        for l in lstm_layers:
-            for n in lstm_layer_nodes:
-                df_raw_data = pd.read_csv(data_path, usecols=cols, dtype=str)
-                model_path = model_root_path + '/lstm_model_layers' + str(l) + '_nodes' + str(n) + '.json'
-                weight_path = model_root_path + '/weights_layer' + str(l) + '_nodes' + str(n) + '.best.hdf5'
-                lstm_conf = {
-                    'max_features': max(time_steps.values()) * len(time_steps),
-                    'input_shape': lstm_input_shape,
-                    'layers': [n] * l,
-                    'activation': lstm_activation,
-                    'recurrent_activation': lstm_recurrent_activation,
-                    'dropout': lstm_dropout,
-                }
-                dense_conf = {
-                    # 时间特征：12个月+31天+24小时
-                    'date_features_shape': date_features_shape,
-                    'layers': dense_layers,
-                    'activation': dense_activation,
-                    'dropout': dense_dropout
-                }
-                y_true, y_pred = train(df_raw_data, model_path, weight_path, epochs=epoch, batch_size=batch,
-                                       lstm_config=lstm_conf,
-                                       dense_config=dense_conf, time_steps=time_steps, test_split=test_split)
-                evaluate.all_metrics(y_true, y_pred)
+        lstm.train(conf)
     else:
-        # 预测
-        print('预测...')
-        test_split = 1
-        df_metrics = pd.DataFrame()
-        for l in lstm_layers:
-            for n in lstm_layer_nodes:
-                df_raw_data = pd.read_csv(data_path, usecols=cols, dtype=str)
-                model_path = model_root_path + '/lstm_model_layers' + str(l) + '_nodes' + str(n) + '.json'
-                weight_path = model_root_path + '/weights_layer' + str(l) + '_nodes' + str(n) + '.best.hdf5'
-                y_true, y_pred = predict(df_raw_data, time_steps, test_split, model_path, weight_path)
-                df_temp = evaluate.all_metrics(y_true, y_pred)
-                df_temp['layers'] = l
-                df_temp['nodes'] = n
-                df_metrics = df_metrics.append(df_temp)
-                print('Write all metrics to file...')
-                df_metrics.to_csv(model_root_path + '/all_metrics_values.csv', index=False)
+        lstm.predict(conf, save_result=True)
 
 
-def different_lstm_layers_and_nodes(param_conf, lstm_layers, lstm_layer_nodes):
+def diff_time_span(is_train=True):
     """
-    对比不同lstm层数和每层不同神经元数网络的性能
-    :param param_conf:
-    :param lstm_layers:
-    :param lstm_layer_nodes:
+    不同时间粒度的预测能力
+    :param is_train:
     :return:
     """
-    for l in lstm_layers:
-        for n in lstm_layer_nodes:
-            df_raw_data = pd.read_csv(param_conf['data_path'], usecols=param_conf['cols'], dtype=str)
-            model_path = param_conf['model_root_path'] + '/lstm_model_layers' + str(l) + '_nodes' + str(n) + '.json'
-            weight_path = param_conf['model_root_path'] + '/weights_layer' + str(l) + '_nodes' + str(n) + '.best.hdf5'
+    time_span = {
+        'day': (1, 12 + 31),
+        'week': (1, 12),
+        # 'month': (1, 12)
+    }
+    conf = lstm.get_init_config()
+    conf['model_conf']['lstm_conf']['layers'] = [300] * 3
+    conf['model_conf']['dense_conf']['layers'] = [1024]
+    conf['model_conf']['batch_size'] = 12
+    for ts in time_span:
+        conf['model_conf']['time_span'] = ts
+        conf['model_conf']['dense_conf']['date_features_shape'] = time_span[ts]
+        conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/DifferentTimeSpan/model_time_span_' + ts + '.best.json'
+        conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/DifferentTimeSpan/weights_time_span_' + ts + '.best.hdf5'
+        if is_train:
+            lstm.train(conf)
+        else:
+            conf['model_conf']['test_split'] = 1.0
+            lstm.predict(conf, save_result=True, show_fitting_curve=True)
 
 
-if __name__ == '__main__':
-    pd.set_option('display.max_columns', None)
-    # ##############################################初始化参数设置######################################################
-    # 模型存储的根目录
-    model_root_path = '../Models/LSTM1'
-    # 数据路径
-    data_path = '../DataSet/Processed/Train/261630033_2016_2017_v1.csv'
-    # 加载哪些数据
-    cols = ['PM25', 'Press', 'RH', 'Temp', 'Wind Speed', 'Wind Direction', 'Month', 'Day', 'Hour']
-    # 训练轮数
-    epoch = 1000
-    # batch size
-    batch = 512
-    # 测试样本比例
-    test_split = 0.4
-    # lstm块里lstm层的层数候选值
-    lstm_layers = [2]
-    # lstm块里lstm层的神经元个数的候选值，如lstm_layers=2，lstm_layer_nodes=300，表示两层lstm层，每层神经元个数均为300
-    lstm_layer_nodes = [300]
-    # lstm层的激活函数，默认为tanh，这里改为softsign
-    lstm_activation = 'softsign'
-    lstm_recurrent_activation = 'hard_sigmoid'
-    # lstm层之间的doupout比例
-    lstm_dropout = 0.3
-    # 全连接层个数及对应每层神经元个数
-    dense_layers = [1024, 1024]
-    # 时间特征层的神经元个数，12个月+31天+24小时
-    date_features_shape = (1, 12 + 31 + 24)
-    # 全连接层之间的doupout比例
-    dense_dropout = 0.5
-    # 各个特征的时间不，由各特征的自相关系数算出，系相关系数>0.4
+def train_in_other_sites(is_train=True):
+    """
+    模型在其他站点数据上训练
+    :param is_train:
+    :return:
+    """
     time_steps = {
         'PM25': 5,
         'Press': 24,
         'RH': 8,
         'Temp': 24,
         'Wind Speed': 11,
-        'Wind Direction': 11
+        'Wind Direction': 11,
+        'CO': 10,
+        'NO2': 8,
+        'O3': 7,
+        'SO2': 4,
+        'PM10': 4,
     }
-    # 全局配置
-    config = {
-        'model_root_path': model_root_path,
-        'data_path': data_path,
-        'data_cols': cols,
-        'epoch': epoch,
-        'batch': batch,
-        'test_split': test_split,
-        'time_steps': time_steps,
-        'lstm_conf': {
-            'max_features': max(time_steps.values()) * len(time_steps),
-            'input_shape': (1, 24 * len(time_steps)),
-            'layers': [lstm_layer_nodes[0]] * lstm_layers[0],
-            'activation': lstm_activation,
-            'recurrent_activation': lstm_recurrent_activation,
-            'dropout': lstm_dropout,
-        },
-        'dense_conf': {
-            'date_features_shape': date_features_shape,
-            'layers': dense_layers,
-            'dropout': dense_dropout
-        }
-    }
-    # ################################################################################################################
+    # stations = ['060376012', '060371103', '060374004']
+    stations = ['261630001']
+    conf = lstm.get_init_config()
+    conf['model_conf']['lstm_conf']['layers'] = [300] * 3
+    conf['model_conf']['dense_conf']['layers'] = [1024]
+    conf['model_conf']['is_drop_outlier'] = True
 
-    # 训练
-    # lstm_layers = [5]
-    # lstm_layer_nodes = [300, 600, 900, 1200]
-    # main(data_path, cols, time_steps, 0.4, model_root_path, lstm_layers, lstm_layer_nodes, is_train=True)
+    # conf['model_conf']['time_steps'] = time_steps
+    # conf['model_conf']['lstm_conf']['input_shape'] = (1, np.sum(list(time_steps.values())))
+    for s in stations:
+        conf['data_conf']['data_path'] = '../DataSet/Processed/Train/' + s + '_2016_2017_v1.csv'
+        conf['model_conf']['epochs'] = 500
+        conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/TrainInOtherSite/model_in_' + s + '.json'
+        conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/TrainInOtherSite/weights_in_' + s + '.best.hdf5'
+        if is_train:
+            conf['model_conf']['test_split'] = 0.3
+            lstm.train(conf)
+        else:
+            conf['model_conf']['test_split'] = 1
+            lstm.predict(conf, save_result=True, show_fitting_curve=True)
 
-    # 预测
-    # lstm_layers = [2, 3, 4, 5]
-    # lstm_layer_nodes = [300, 600, 900, 1200]
-    # main(data_path, cols, time_steps, 1, model_root_path, lstm_layers, lstm_layer_nodes, is_train=False)
-    # ################################################################################################################
 
-    # ################################################################################################################
-    # 画最优模型的拟合曲线
-    # best_model_path = model_root_path + '/lstm_model_layers3_nodes600.json'
-    # best_weight_path = model_root_path + '/weights_layer3_nodes600.best.hdf5'
-    # draw_one_model_fitting_curve(data_path, cols, time_steps, 0.4, best_model_path, best_weight_path)
-    # ###############################################################################################################
-    # a = ''
-    # if not a:
-    #     print(1)
+def use_best_model_predict_other_sites():
+    """
+    用最好的模型预测其他站点，查看模型对其他站点的泛化性能
+    :return:
+    """
+    stations = ['261630001', '060376012', '060371103', '060374004']
+    years = ['2016', '2017']
+    conf = lstm.get_init_config()
+    conf['model_conf']['test_split'] = 1.0
+    conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/model.best.json'
+    conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/weights.best.hdf5'
+    metrics = pd.DataFrame()
+    for s in stations:
+        for y in years:
+            conf['data_conf']['data_path'] = '../DataSet/Processed/Train/' + s + '_' + y + '_v1.csv'
+            print(conf['data_conf']['data_path'])
+            result = lstm.predict(conf)
+            df_temp = result['all_metrics']
+            df_temp['Station'] = s
+            df_temp['Year'] = y
+            metrics = metrics.append(df_temp)
+    metrics.to_csv(conf['model_conf']['model_root_path'] + '/PredictOtherSites/use_best_model_predict_other_sites.csv', index=False)
+
+
+def different_future_time_point_predict():
+    """
+    用过去的数据预测未来不同时间点的值
+    :return:
+    """
+    print('用过去的数据预测未来不同时间点的值....')
+    times = [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+    conf = lstm.get_init_config()
+    conf['model_conf']['test_split'] = 1.0
+    conf['model_conf']['model_path'] = conf['model_conf']['model_root_path'] + '/model.best.json'
+    conf['model_conf']['weight_path'] = conf['model_conf']['model_root_path'] + '/weights.best.hdf5'
+    metrics = pd.DataFrame()
+    for t in times:
+        conf['model_conf']['target_offset'] = t
+        result = lstm.predict(conf)
+        df_temp = result['all_metrics']
+        df_temp['Future Time'] = t
+        metrics = metrics.append(df_temp)
+    metrics.to_csv(conf['model_conf']['model_root_path'] + '/DifferentFutureTime/use_best_model_predict_diff_future_time_point.csv', index=False)
+
+
+if __name__ == '__main__':
+    pd.set_option('display.max_columns', None)
+    # find_best_lstm_layers_nodes()
+    find_best_lstm_layers_nodes(is_train=False)
+
+    # find_best_dense_layers_nodes()
+    # find_best_dense_layers_nodes(is_train=False)
+
+    # effect_of_other_series_feature()
+    # effect_of_other_series_feature(is_train=False)
+
+    # fixed_time_lags()
+    # fixed_time_lags(is_train=False)
+
+    # diff_time_span()
+    # diff_time_span(is_train=False)
+
+    # train_in_other_sites()
+    # train_in_other_sites(is_train=False)
+
+    # use_best_model_predict_other_sites()
+
+    # different_future_time_point_predict()

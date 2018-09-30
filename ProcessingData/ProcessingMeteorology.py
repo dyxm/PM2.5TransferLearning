@@ -19,5 +19,6 @@ for c in classes:
         for pc in param_code:
             df_pm25_new_pc = df_pm25_new[df_pm25_new['Parameter Code'] == pc]
             df_pm25_new_pc.pop('Parameter Code')
+            # print(df_pm25_new_pc)
             df_pm25_new_pc.to_csv('../DataSet/Processed/Meteorology/hourly_' + c + '_' + pc + '_' + y + '.csv', index=False)
             print(c, pc, y)
